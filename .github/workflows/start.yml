@@ -1,0 +1,138 @@
+name: OmniRoute Runner
+
+on:
+  workflow_dispatch:   # chạy tay qua tab Actions
+  schedule:
+    - cron: '0 */6 * * *'   # backup: tự chạy lại mỗi 6h nếu self-trigger (bước 4) lỡ fail giữa chừng
+
+# ---------- FIX: chặn cron và chuỗi self-trigger chạy chồng lấn ----------
+# Trước đây cron (mỗi 6h = 360p) và self-trigger (mỗi ~340p) chạy độc lập,
+# lệch pha dần theo thời gian -> có lúc 2 job cùng sống -> cùng push đè
+# lên nhánh data-store -> dữ liệu (provider_connections...) lúc mất lúc có.
+# Với concurrency group dùng chung tên, nếu 1 job đang chạy mà job khác
+# (dù từ cron hay từ self-trigger) được gọi, job mới sẽ NẰM CHỜ (queued)
+# thay vì chạy song song và giẫm đạp dữ liệu.
+concurrency:
+  group: omniroute-runner
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: write   # cần write để push data lên branch data-store
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355   # GitHub free runner giới hạn cứng 360p (6h), chừa buffer 5p
+
+    steps:
+      # ---------- 1. Khôi phục data từ branch data-store (nếu có) ----------
+      - name: Restore previous data
+        run: |
+          git clone --depth 1 --branch data-store \
+            https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}.git \
+            data-checkout 2>/dev/null && echo "Found data-store branch" || echo "Chưa có branch data-store, chạy như lần đầu"
+          mkdir -p ./data
+          if [ -d data-checkout ]; then
+            cp -r data-checkout/. ./data/ 2>/dev/null || true
+            rm -rf ./data/.git   # QUAN TRỌNG: bỏ .git đã clone kèm, tránh dính branch data-store vào ./data
+            rm -rf data-checkout
+            echo "Đã khôi phục $(du -sh ./data | cut -f1) dữ liệu"
+          fi
+
+      # ---------- 2. Chạy OmniRoute, mount data đã restore ----------
+      # FIX: đổi sang tag "-web" vì các provider đang dùng (claude-web,
+      # chatgpt-web, gemini-web, deepseek-web, zai-web) chạy qua Playwright
+      # (giả lập phiên trình duyệt). Tag "latest" gốc KHÔNG bundle Chromium/
+      # browsers.json -> các provider này load lỗi 500 "no provider configured".
+      - name: Run OmniRoute
+        run: |
+          mkdir -p ./data
+          chmod -R 777 ./data
+          docker run -d --name omniroute -p 20128:20128 \
+            -v $(pwd)/data:/app/data \
+            diegosouzapw/omniroute:latest-web
+          sleep 8
+          echo "----- container logs -----"
+          docker logs omniroute
+
+      # ---------- 2.1. Tự kiểm tra + tự vá nếu image vẫn thiếu Chromium ----------
+      # Lớp phòng thủ thêm: dù đã dùng tag -web, nếu bản build đó vẫn lỡ thiếu
+      # browsers.json (do lỗi build phía upstream), tự cài lại thay vì để lỗi âm thầm.
+      - name: Ensure Playwright browsers installed
+        run: |
+          if ! docker exec omniroute test -f /app/node_modules/playwright/node_modules/playwright-core/browsers.json 2>/dev/null; then
+            echo "Thiếu browsers.json, đang cài lại Chromium..."
+            docker exec omniroute npx playwright install --with-deps chromium || true
+            docker restart omniroute
+            sleep 8
+            echo "----- container logs sau khi vá -----"
+            docker logs omniroute --tail 50
+          else
+            echo "browsers.json OK, không cần vá."
+          fi
+
+      # ---------- 3. Cài & kết nối chisel client vào relay server trên Render ----------
+      - name: Install & connect chisel tunnel
+        run: |
+          CHISEL_URL=$(curl -sL https://api.github.com/repos/jpillora/chisel/releases/latest \
+            | grep "browser_download_url" \
+            | grep "linux_amd64.gz" \
+            | cut -d '"' -f 4)
+          echo "Downloading: $CHISEL_URL"
+          curl -sL "$CHISEL_URL" -o chisel.gz
+          gunzip chisel.gz
+          chmod +x chisel
+          ./chisel client https://omniroute-geff.onrender.com R:8080:localhost:20128 &
+          sleep 5
+          echo "Tunnel connected -> https://omniroute-geff.onrender.com"
+
+      # ---------- 3.1. Cài & chạy ngrok tunnel với domain cố định (free static domain) ----------
+      - name: Install & run ngrok tunnel (fixed domain)
+        run: |
+          curl -sL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt update && sudo apt install -y ngrok
+          ngrok config add-authtoken ${{ secrets.NGROK_TOKEN }}
+          nohup ngrok http 20128 --url=${{ secrets.NGROK_DOMAIN }} --log=stdout > ngrok.log 2>&1 &
+          sleep 6
+          echo "----- ngrok log -----"
+          cat ngrok.log
+          echo "Ngrok tunnel -> https://${{ secrets.NGROK_DOMAIN }}"
+
+      # ---------- 4. Chờ tới gần hết giờ, rồi snapshot data TRƯỚC khi trigger job kế tiếp ----------
+      - name: Wait until near timeout
+        run: sleep 20400   # ~340 phút, chừa buffer để job2 kịp lên trước khi job1 (355p) kết thúc
+
+      # ---------- 5. Lưu data mới nhất TRƯỚC khi trigger job2, để job2 restore đúng bản mới ----------
+      - name: Snapshot data before triggering next job
+        if: always()
+        run: |
+          docker cp omniroute:/app/data/. ./data/ || true
+
+      - name: Push data to GitHub (branch data-store)
+        if: always()
+        run: |
+          rm -rf data-checkout
+          mkdir -p data-checkout
+          cp -r ./data/. data-checkout/ 2>/dev/null || true
+          cd data-checkout
+          git init -q
+          git checkout -q -B data-store   # -B: tạo mới hoặc reset nếu đã tồn tại, không lỗi như -b
+          git config user.email "actions@github.com"
+          git config user.name "github-actions[bot]"
+          git add -A
+          git commit -q -m "Data snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)" || echo "Không có gì thay đổi để commit"
+          git remote add origin https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}.git
+          git push -f origin data-store   # force push, chỉ giữ 1 commit -> tránh phình repo
+
+      # ---------- 6. Tự kích hoạt job kế tiếp sau khi data đã được upload xong ----------
+      - name: Trigger next job
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GH_PAT }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/start.yml/dispatches \
+            -d '{"ref":"main"}'
+          echo "Triggered next run"
+          sleep 300   # sống thêm 5p để job2 kịp connect chisel, giảm gap gần về 0
